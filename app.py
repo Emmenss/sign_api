@@ -1,118 +1,112 @@
 """
 API Flask — Reconnaissance Langue des Signes
-Déployée sur Render.com
+Classes correctes tirées du notebook : hello, thanks, Iloveyou, no, yes
+Optimisé pour minimiser la latence sur Render Free
 """
 
 import base64
-import os
 import logging
+import os
 
 import cv2
 import mediapipe as mp
 import numpy as np
 from flask import Flask, jsonify, request
 
-# Logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# CONFIG
+# ⚠️ CLASSES EXACTES DU NOTEBOOK — NE PAS CHANGER L'ORDRE
 # ─────────────────────────────────────────────
-SEQUENCE_LENGTH = 30
-THRESHOLD       = 0.7
+ACTIONS = np.array(["hello", "thanks", "Iloveyou", "no", "yes"])
 
-# ⚠️ Mets ici tes classes dans le même ordre qu'à l'entraînement
-ACTIONS = np.array(['bonjour', 'merci', 'oui', 'non', 'boire'])
+SEQUENCE_LENGTH = 30   # identique au notebook
+THRESHOLD       = 0.7  # seuil de confiance
 
-# ─────────────────────────────────────────────
-# CHARGEMENT DU MODÈLE (lazy — au premier appel)
-# Render a une RAM limitée, on évite de tout charger au démarrage
-# ─────────────────────────────────────────────
+app = Flask(__name__)
+
+# ── MediaPipe ────────────────────────────────
+mp_holistic = mp.solutions.holistic
+_holistic   = None
+
+def get_holistic():
+    global _holistic
+    if _holistic is None:
+        # model_complexity=0 = plus rapide, suffisant pour keypoints
+        _holistic = mp_holistic.Holistic(
+            static_image_mode=False,
+            model_complexity=0,
+            min_detection_confidence=0.4,
+            min_tracking_confidence=0.4,
+        )
+        logger.info("✅ MediaPipe Holistic initialisé (complexity=0)")
+    return _holistic
+
+# ── Modèle ───────────────────────────────────
 _model = None
 
 def get_model():
     global _model
     if _model is None:
-        # Import ici pour ne pas bloquer le démarrage si TF est lent
         import tensorflow as tf
-        model_path = os.path.join(os.path.dirname(__file__), 'action.h5')
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                "action.h5 introuvable. Place le fichier à la racine du projet."
-            )
+        path = os.path.join(os.path.dirname(__file__), "action.h5")
+        if not os.path.exists(path):
+            raise FileNotFoundError("action.h5 introuvable à la racine du projet")
         logger.info("⏳ Chargement du modèle...")
-        _model = tf.keras.models.load_model(model_path)
-        logger.info(f"✅ Modèle chargé — Input: {_model.input_shape}")
+        _model = tf.keras.models.load_model(path)
+        logger.info(f"✅ Modèle chargé — {_model.input_shape} → {_model.output_shape}")
     return _model
 
-# ─────────────────────────────────────────────
-# MEDIAPIPE — instance unique réutilisée
-# ─────────────────────────────────────────────
-mp_holistic = mp.solutions.holistic
-_holistic    = None
-
-def get_holistic():
-    global _holistic
-    if _holistic is None:
-        _holistic = mp_holistic.Holistic(
-            min_detection_confidence=0.4,
-            min_tracking_confidence=0.4,
-            static_image_mode=False,
-        )
-    return _holistic
-
-# ─────────────────────────────────────────────
-# FLASK
-# ─────────────────────────────────────────────
-app = Flask(__name__)
-
-# Buffer de séquence par session — clé = identifiant client
-# (simple dict en mémoire, suffisant pour une démo)
+# ── Buffer par session ────────────────────────
 _sequences: dict[str, list] = {}
 
 
 # ─────────────────────────────────────────────
-# UTILITAIRES
+# EXTRACT KEYPOINTS — identique au notebook
+# ordre : pose + face + lh + rh = 1662 valeurs
 # ─────────────────────────────────────────────
 def extract_keypoints(results) -> np.ndarray:
     pose = (
-        np.array([[r.x, r.y, r.z, r.visibility]
-                  for r in results.pose_landmarks.landmark]).flatten()
+        np.array([[r.x, r.y, r.z, r.visibility] for r in results.pose_landmarks.landmark]).flatten()
         if results.pose_landmarks else np.zeros(33 * 4)
     )
     face = (
-        np.array([[r.x, r.y, r.z]
-                  for r in results.face_landmarks.landmark]).flatten()
+        np.array([[r.x, r.y, r.z] for r in results.face_landmarks.landmark]).flatten()
         if results.face_landmarks else np.zeros(468 * 3)
     )
     lh = (
-        np.array([[r.x, r.y, r.z]
-                  for r in results.left_hand_landmarks.landmark]).flatten()
+        np.array([[r.x, r.y, r.z] for r in results.left_hand_landmarks.landmark]).flatten()
         if results.left_hand_landmarks else np.zeros(21 * 3)
     )
     rh = (
-        np.array([[r.x, r.y, r.z]
-                  for r in results.right_hand_landmarks.landmark]).flatten()
+        np.array([[r.x, r.y, r.z] for r in results.right_hand_landmarks.landmark]).flatten()
         if results.right_hand_landmarks else np.zeros(21 * 3)
     )
-    return np.concatenate([pose, face, lh, rh])
+    return np.concatenate([pose, face, lh, rh])  # (1662,)
 
 
-def decode_frame(b64_string: str, width: int, height: int):
+# ─────────────────────────────────────────────
+# DÉCODAGE FRAME
+# ─────────────────────────────────────────────
+def decode_frame(b64: str, width: int, height: int):
     try:
-        raw    = base64.b64decode(b64_string)
+        raw    = base64.b64decode(b64)
         np_arr = np.frombuffer(raw, np.uint8)
 
-        # Essai JPEG
+        # Essai JPEG (format le plus courant depuis Flutter)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if frame is not None:
+            # Réduire la résolution pour accélérer MediaPipe
+            frame = cv2.resize(frame, (320, 240))
             return frame
 
-        # Fallback YUV plan Y → niveaux de gris
+        # Fallback YUV — plan luminance seul
         if len(np_arr) >= width * height:
-            gray = np_arr[:width * height].reshape((height, width))
-            return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            gray  = np_arr[:width * height].reshape((height, width))
+            frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            frame = cv2.resize(frame, (320, 240))
+            return frame
 
         return None
     except Exception as e:
@@ -126,9 +120,10 @@ def decode_frame(b64_string: str, width: int, height: int):
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "service": "Sign Language Recognition API",
+        "service": "Sign Language API",
         "status":  "online",
         "actions": ACTIONS.tolist(),
+        "sequence_length": SEQUENCE_LENGTH,
     })
 
 
@@ -142,15 +137,6 @@ def health():
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """
-    Body JSON :
-    {
-        "frame"     : "<base64>",
-        "width"     : 640,
-        "height"    : 480,
-        "session_id": "device-uuid"   ← optionnel, mais recommandé
-    }
-    """
     data = request.get_json(force=True, silent=True)
     if not data or "frame" not in data:
         return jsonify({"error": "Champ 'frame' manquant"}), 400
@@ -159,50 +145,51 @@ def predict():
     height     = int(data.get("height", 480))
     session_id = data.get("session_id", "default")
 
-    # Décoder la frame
+    # 1. Décoder
     frame = decode_frame(data["frame"], width, height)
     if frame is None:
-        return jsonify({"error": "Impossible de décoder la frame"}), 400
+        return jsonify({"error": "Frame illisible"}), 400
 
-    # Détection MediaPipe
-    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    image_rgb.flags.writeable = False
-    results = get_holistic().process(image_rgb)
+    # 2. MediaPipe
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    rgb.flags.writeable = False
+    results = get_holistic().process(rgb)
 
-    # Extraction keypoints
-    keypoints = extract_keypoints(results)
+    # 3. Keypoints
+    kp = extract_keypoints(results)
 
-    # Buffer par session
+    # 4. Buffer glissant
     seq = _sequences.setdefault(session_id, [])
-    seq.append(keypoints.tolist())
+    seq.append(kp.tolist())
     if len(seq) > SEQUENCE_LENGTH:
         _sequences[session_id] = seq[-SEQUENCE_LENGTH:]
 
-    # Prédiction
+    buf_size = len(_sequences[session_id])
+
+    # 5. Prédiction dès que le buffer est plein
     prediction    = None
     confidence    = 0.0
     probabilities = {}
 
-    if len(_sequences[session_id]) == SEQUENCE_LENGTH:
-        model      = get_model()
-        input_data = np.expand_dims(_sequences[session_id], axis=0)
-        res        = model.predict(input_data, verbose=0)[0]
+    if buf_size == SEQUENCE_LENGTH:
+        inp = np.expand_dims(_sequences[session_id], axis=0)  # [1, 30, 1662]
+        res = get_model().predict(inp, verbose=0)[0]           # [5]
 
-        probabilities = {
-            ACTIONS[i]: float(round(res[i], 4))
-            for i in range(len(ACTIONS))
-        }
-
-        best_idx   = int(np.argmax(res))
-        confidence = float(res[best_idx])
+        probabilities = {ACTIONS[i]: float(round(res[i], 4)) for i in range(len(ACTIONS))}
+        best          = int(np.argmax(res))
+        confidence    = float(res[best])
 
         if confidence >= THRESHOLD:
-            prediction = ACTIONS[best_idx]
+            prediction = ACTIONS[best]
+
+        # Décaler le buffer de 15 frames au lieu de tout garder
+        # → nouvelle prédiction toutes les 15 frames (plus réactif)
+        _sequences[session_id] = _sequences[session_id][15:]
 
     return jsonify({
         "prediction":    prediction,
         "confidence":    round(confidence, 4),
-        "buffer_size":   len(_sequences[session_id]),
+        "buffer_size":   buf_size,
         "probabilities": probabilities,
     })
 
@@ -212,13 +199,11 @@ def reset():
     data       = request.get_json(force=True, silent=True) or {}
     session_id = data.get("session_id", "default")
     _sequences.pop(session_id, None)
-    return jsonify({"status": "buffer réinitialisé", "session_id": session_id})
+    return jsonify({"status": "ok", "session_id": session_id})
 
 
-# ─────────────────────────────────────────────
-# POINT D'ENTRÉE LOCAL (pas utilisé par Render)
-# Render utilise : gunicorn app:app
-# ─────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    logger.info(f"🚀 Démarrage sur port {port}")
+    logger.info(f"   Classes : {ACTIONS.tolist()}")
     app.run(host="0.0.0.0", port=port, debug=False)
