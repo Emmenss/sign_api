@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: sign-language-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --timeout 120 --bind 0.0.0.0:$PORT
+    plan: free                  # passe à "starter" si le modèle dépasse 512 MB RAM
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
